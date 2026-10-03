@@ -114,29 +114,37 @@ function createMcpServer() {
         version: "1.0.0",
     });
 
-    // ---- 1. CREATE PART (preserved + extended) ----
+    // ---- 1. CREATE PART (preserved + extended: Seat/VehicleSeat, shape, rotation) ----
     server.registerTool(
         "roblox_create_part",
         {
-            description: "Create an anchored Part inside Roblox Studio. Waits for Studio confirmation.",
+            description: "Create a Part, Seat, or VehicleSeat inside Roblox Studio. Supports shape (Block/Ball/Cylinder) and rotation in degrees. Waits for Studio confirmation. Omitting className defaults to Part for backward compatibility.",
             inputSchema: {
                 name: z.string().optional(),
+                className: z.enum(["Part", "Seat", "VehicleSeat"]).optional().describe("Roblox class to create. Defaults to Part."),
                 parent: z.string().optional().describe("Parent path, e.g. Workspace or Workspace.Folder. Defaults to Workspace."),
                 position: z.array(z.number()).length(3),
                 size: z.array(z.number()).length(3),
+                rotation: z.array(z.number()).length(3).optional().describe("Orientation in degrees [rx, ry, rz]. Optional."),
+                orientation: z.array(z.number()).length(3).optional().describe("Alias for rotation in degrees [rx, ry, rz]. Optional."),
+                shape: z.enum(["Block", "Ball", "Cylinder"]).optional().describe("Enum.PartType shape. Defaults to Block."),
                 anchored: z.boolean().optional(),
                 material: z.string().optional().describe("Enum.Material name, e.g. SmoothPlastic, Neon, Wood"),
                 transparency: z.number().min(0).max(1).optional(),
                 color: z.array(z.number()).length(3).optional().describe("RGB 0-255, e.g. [255,0,0]"),
             },
         },
-        async ({ name, parent, position, size, anchored, material, transparency, color }) => {
+        async ({ name, className, parent, position, size, rotation, orientation, shape, anchored, material, transparency, color }) => {
             const data = {
                 name: name || "AI_Part",
+                className: className || "Part",
                 parent: parent || "Workspace",
                 position,
                 size,
             };
+            const rot = rotation ?? orientation;
+            if (rot !== undefined) data.rotation = rot;
+            if (shape !== undefined) data.shape = shape;
             if (anchored !== undefined) data.anchored = anchored;
             if (material !== undefined) data.material = material;
             if (transparency !== undefined) data.transparency = transparency;
@@ -148,7 +156,7 @@ function createMcpServer() {
                     return formatSuccess(
                         "create_part",
                         outcome.id,
-                        `Part: ${data.name}\nPosition: ${position.join(", ")}\nSize: ${size.join(", ")}\nResult: ${JSON.stringify(outcome.result)}`
+                        `Part: ${data.name} (${data.className})\nPosition: ${position.join(", ")}\nSize: ${size.join(", ")}\nResult: ${JSON.stringify(outcome.result)}`
                     );
                 }
                 return formatFailure("create_part", outcome.id, outcome.error);
@@ -237,15 +245,15 @@ function createMcpServer() {
         }
     );
 
-    // ---- 5. SET PROPERTY (controlled whitelist) ----
+    // ---- 5. SET PROPERTY (controlled whitelist + vehicle-safe extension) ----
     server.registerTool(
         "roblox_set_property",
         {
-            description: "Set a whitelisted safe property (Name, Anchored, Transparency, CanCollide, Size, Position, Color, Material) on an object.",
+            description: "Set a whitelisted safe property on an object. Supports construction props (Name, Anchored, Transparency, CanCollide, Size, Position, Orientation/Rotation, Shape, Color, Material), physical props (Massless, Density, Friction, Elasticity, FrictionWeight, ElasticityWeight), and Model PrimaryPart (validated descendant path).",
             inputSchema: {
                 path: z.string().min(1).describe("Object path, e.g. Workspace.TestPart"),
-                property: z.enum(["Name", "Anchored", "Transparency", "CanCollide", "Size", "Position", "Color", "Material"]),
-                value: z.any().describe("New value. Vector3 as [x,y,z], Color as [r,g,b] 0-255, Material as string, booleans/numbers/strings otherwise."),
+                property: z.enum(["Name", "Anchored", "Transparency", "CanCollide", "Size", "Position", "Orientation", "Rotation", "Shape", "Color", "Material", "Massless", "Density", "Friction", "Elasticity", "FrictionWeight", "ElasticityWeight", "PrimaryPart"]),
+                value: z.any().describe("New value. Vector3 as [x,y,z], Orientation/Rotation as degrees [x,y,z], Color as [r,g,b] 0-255, Material/Shape as string, PrimaryPart as part path string, booleans/numbers/strings otherwise."),
             },
         },
         async ({ path, property, value }) => {
@@ -265,7 +273,7 @@ function createMcpServer() {
     server.registerTool(
         "roblox_inspect_object",
         {
-            description: "Inspect an object in Roblox Studio. Returns Name, ClassName, path, children, and relevant properties.",
+            description: "Inspect an object in Roblox Studio. Returns Name, ClassName, path, children, and relevant properties including Orientation, Shape, Massless, physical props, and Model PrimaryPart where available.",
             inputSchema: {
                 path: z.string().min(1).describe("Object path, e.g. Workspace"),
             },

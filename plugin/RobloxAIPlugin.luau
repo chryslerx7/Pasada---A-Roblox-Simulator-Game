@@ -1,7 +1,10 @@
--- RobloxAI Studio Plugin (Pasada - Phase 0 Tooling)
+-- RobloxAI Studio Plugin (Pasada - Phase 2C-PREP Tooling)
 -- Polls Bridge at 127.0.0.1:3847, executes whitelisted actions, reports results.
 -- Supported actions: create_folder, create_script, create_model, create_part,
 --   set_property, inspect_object, delete_object
+-- create_part supports: className Part|Seat|VehicleSeat (default Part),
+--   shape Block|Ball|Cylinder, rotation/Orientation in degrees.
+-- set_property supports safe construction props + PrimaryPart (validated).
 -- No arbitrary Lua execution. No unrestricted filesystem/shell access.
 
 local HttpService = game:GetService("HttpService")
@@ -98,6 +101,69 @@ local function toMaterial(value)
 	return nil
 end
 
+local ALLOWED_PART_CLASSES = {
+	Part = true,
+	Seat = true,
+	VehicleSeat = true,
+}
+
+local function toPartShape(value)
+	if typeof(value) == "EnumItem" then
+		return value
+	end
+	if type(value) == "string" then
+		if value ~= "Block" and value ~= "Ball" and value ~= "Cylinder" then
+			return nil
+		end
+		local ok, shape = pcall(function()
+			return (Enum.PartType :: any)[value]
+		end)
+		if ok and shape then
+			return shape
+		end
+	end
+	return nil
+end
+
+local function toOrientationDegrees(value)
+	if typeof(value) == "Vector3" then
+		return value
+	end
+	if type(value) == "table" then
+		local x, y, z
+		if #value == 3 then
+			x, y, z = tonumber(value[1]), tonumber(value[2]), tonumber(value[3])
+		elseif value.x ~= nil or value.y ~= nil or value.z ~= nil then
+			x, y, z = tonumber(value.x), tonumber(value.y), tonumber(value.z)
+		elseif value.X ~= nil or value.Y ~= nil or value.Z ~= nil then
+			x, y, z = tonumber(value.X), tonumber(value.Y), tonumber(value.Z)
+		end
+		if x and y and z then
+			return Vector3.new(x, y, z)
+		end
+	end
+	return nil
+end
+
+local function toPositionVector(value)
+	if typeof(value) == "Vector3" then
+		return value
+	end
+	if type(value) == "table" then
+		if #value == 3 then
+			return toVector3(value)
+		end
+		if value.x ~= nil or value.y ~= nil or value.z ~= nil then
+			local x, y, z = tonumber(value.x), tonumber(value.y), tonumber(value.z)
+			if x and y and z then
+				return Vector3.new(x, y, z)
+			end
+			return nil
+		end
+	end
+	return toVector3(value)
+end
+
 local function fullPathOf(instance)
 	local parts = {}
 	local current = instance
@@ -182,52 +248,119 @@ end
 local function actionCreatePart(data)
 	local name = data.name or "AI_Part"
 	local parentPath = data.parent or "Workspace"
+	local className = data.className or "Part"
 	if type(name) ~= "string" or name == "" then
 		return false, "create_part: 'name' must be a non-empty string"
+	end
+	if type(className) ~= "string" or not ALLOWED_PART_CLASSES[className] then
+		return false, "create_part: 'className' must be one of: Part, Seat, VehicleSeat"
 	end
 	local parent, err = resolvePath(parentPath)
 	if not parent then
 		return false, ("create_part: parent not found: %s"):format(err)
 	end
-	local position = data.position and toVector3(data.position) or Vector3.new(0, 5, 0)
-	if data.position and not toVector3(data.position) then
-		return false, "create_part: 'position' must be an array of 3 numbers [x, y, z]"
+	local position = Vector3.new(0, 5, 0)
+	if data.position ~= nil then
+		local p = toPositionVector(data.position)
+		if not p then
+			return false, "create_part: 'position' must be an array of 3 numbers [x, y, z] or {x,y,z}"
+		end
+		position = p
 	end
-	local size = data.size and toVector3(data.size) or Vector3.new(4, 1, 2)
-	if data.size and not toVector3(data.size) then
-		return false, "create_part: 'size' must be an array of 3 numbers [x, y, z]"
+	local size = Vector3.new(4, 1, 2)
+	if data.size ~= nil then
+		local s = toVector3(data.size)
+		if not s then
+			return false, "create_part: 'size' must be an array of 3 numbers [x, y, z]"
+		end
+		size = s
 	end
-	local part = Instance.new("Part")
+	local rotation: Vector3? = nil
+	local rotInput = data.rotation or data.orientation
+	if rotInput ~= nil then
+		rotation = toOrientationDegrees(rotInput)
+		if not rotation then
+			return false, "create_part: 'rotation'/'orientation' must be 3 numbers in degrees [x, y, z] or {x,y,z}"
+		end
+	end
+	local shape = nil
+	if data.shape ~= nil then
+		shape = toPartShape(data.shape)
+		if not shape then
+			return false, "create_part: 'shape' must be one of: Block, Ball, Cylinder"
+		end
+	end
+	local part
+	local okCreate, createErr = pcall(function()
+		part = Instance.new(className)
+	end)
+	if not okCreate or not part then
+		return false, ("create_part: failed to create class %s: %s"):format(tostring(className), tostring(createErr))
+	end
+	local function fail(msg)
+		pcall(function()
+			part:Destroy()
+		end)
+		return false, msg
+	end
 	part.Name = name
-	part.Size = size
-	part.Position = position
+	-- Size first (Ball/Cylinder derive dimensions from Size; setting before Parent is safest)
+	do
+		local ok, e = pcall(function()
+			part.Size = size
+		end)
+		if not ok then
+			return fail(("create_part: invalid 'size': %s"):format(tostring(e)))
+		end
+	end
+	if shape ~= nil then
+		local ok, e = pcall(function()
+			(part :: any).Shape = shape
+		end)
+		if not ok then
+			return fail(("create_part: 'shape' not supported for %s: %s"):format(className, tostring(e)))
+		end
+	end
+	do
+		local ok, e = pcall(function()
+			part.Position = position
+		end)
+		if not ok then
+			return fail(("create_part: invalid 'position': %s"):format(tostring(e)))
+		end
+	end
+	if rotation ~= nil then
+		local ok, e = pcall(function()
+			(part :: any).Orientation = rotation
+		end)
+		if not ok then
+			return fail(("create_part: invalid 'rotation': %s"):format(tostring(e)))
+		end
+	end
 	part.Anchored = if data.anchored == nil then true else (data.anchored == true)
 	if data.material ~= nil then
 		local mat = toMaterial(data.material)
 		if not mat then
-			part:Destroy()
-			return false, ("create_part: invalid 'material': %s"):format(tostring(data.material))
+			return fail(("create_part: invalid 'material': %s"):format(tostring(data.material)))
 		end
 		part.Material = mat
 	end
 	if data.transparency ~= nil then
 		local t = tonumber(data.transparency)
 		if not t or t < 0 or t > 1 then
-			part:Destroy()
-			return false, "create_part: 'transparency' must be a number 0-1"
+			return fail("create_part: 'transparency' must be a number 0-1")
 		end
 		part.Transparency = t
 	end
 	if data.color ~= nil then
 		local c = toColor3(data.color)
 		if not c then
-			part:Destroy()
-			return false, "create_part: 'color' must be an array of 3 numbers [r, g, b] 0-255"
+			return fail("create_part: 'color' must be an array of 3 numbers [r, g, b] 0-255")
 		end
 		part.Color = c
 	end
 	part.Parent = parent
-	return true, { path = fullPathOf(part), name = part.Name, className = "Part" }
+	return true, { path = fullPathOf(part), name = part.Name, className = part.ClassName }
 end
 
 local SAFE_PROPERTIES = {
@@ -237,9 +370,69 @@ local SAFE_PROPERTIES = {
 	CanCollide = true,
 	Size = true,
 	Position = true,
+	Orientation = true,
+	Rotation = true,
+	Shape = true,
 	Color = true,
 	Material = true,
+	Massless = true,
+	Density = true,
+	Friction = true,
+	Elasticity = true,
+	FrictionWeight = true,
+	ElasticityWeight = true,
+	PrimaryPart = true,
 }
+
+local function setCustomPhysicalScalar(instance, field, num)
+	-- Update one Density/Friction/Elasticity field via PhysicalProperties.new,
+	-- preserving the other fields. Only for BaseParts.
+	if not instance:IsA("BasePart") then
+		return false, ("set_property: %s requires a BasePart"):format(field)
+	end
+	local current: PhysicalProperties
+	do
+		local ok, pp = pcall(function()
+			return (instance :: any).CustomPhysicalProperties
+		end)
+		if ok and typeof(pp) == "PhysicalProperties" then
+			current = pp
+		else
+			-- Fall back to current material defaults
+			local ok2, def = pcall(function()
+				return PhysicalProperties.new((instance :: any).Material)
+			end)
+			if ok2 then
+				current = def
+			else
+				current = PhysicalProperties.new(1, 0.3, 0.5, 1, 1)
+			end
+		end
+	end
+	local density = current.Density
+	local friction = current.Friction
+	local elasticity = current.Elasticity
+	local frictionWeight = current.FrictionWeight
+	local elasticityWeight = current.ElasticityWeight
+	if field == "Density" then
+		density = num
+	elseif field == "Friction" then
+		friction = num
+	elseif field == "Elasticity" then
+		elasticity = num
+	elseif field == "FrictionWeight" then
+		frictionWeight = num
+	elseif field == "ElasticityWeight" then
+		elasticityWeight = num
+	end
+	local ok, e = pcall(function()
+		(instance :: any).CustomPhysicalProperties = PhysicalProperties.new(density, friction, elasticity, frictionWeight, elasticityWeight)
+	end)
+	if not ok then
+		return false, ("set_property failed: %s"):format(tostring(e))
+	end
+	return true
+end
 
 local function actionSetProperty(data)
 	local pathStr = data.path
@@ -249,11 +442,45 @@ local function actionSetProperty(data)
 		return false, "set_property: 'path' (non-empty string) is required"
 	end
 	if type(property) ~= "string" or not SAFE_PROPERTIES[property] then
-		return false, "set_property: 'property' must be one of: Name, Anchored, Transparency, CanCollide, Size, Position, Color, Material"
+		return false, "set_property: 'property' must be one of: Name, Anchored, Transparency, CanCollide, Size, Position, Orientation, Rotation, Shape, Color, Material, Massless, Density, Friction, Elasticity, FrictionWeight, ElasticityWeight, PrimaryPart"
 	end
 	local instance, err = resolvePath(pathStr)
 	if not instance then
 		return false, ("set_property: object not found: %s"):format(err)
+	end
+	-- PrimaryPart: model-only, validated descendant BasePart
+	if property == "PrimaryPart" then
+		if not instance:IsA("Model") then
+			return false, "set_property: PrimaryPart target must be a Model"
+		end
+		if type(value) ~= "string" or value == "" then
+			return false, "set_property: PrimaryPart value must be a part path string or child name"
+		end
+		local part: Instance?
+		if string.find(value, "%.") then
+			part = resolvePath(value)
+			if not part then
+				return false, ("set_property: PrimaryPart part not found: %s"):format(value)
+			end
+		else
+			part = instance:FindFirstChild(value)
+			if not part then
+				return false, ("set_property: PrimaryPart child not found in model: %s"):format(value)
+			end
+		end
+		if not part:IsA("BasePart") then
+			return false, "set_property: PrimaryPart must be a BasePart (Part, Seat, or VehicleSeat)"
+		end
+		if not part:IsDescendantOf(instance) then
+			return false, "set_property: PrimaryPart must be a descendant of the target Model"
+		end
+		local ok, e = pcall(function()
+			(instance :: any).PrimaryPart = part
+		end)
+		if not ok then
+			return false, ("set_property failed: %s"):format(tostring(e)))
+		end
+		return true, { path = fullPathOf(instance), property = property, primaryPart = fullPathOf(part) }
 	end
 	local ok, setErr
 	if property == "Name" then
@@ -263,7 +490,10 @@ local function actionSetProperty(data)
 		ok, setErr = pcall(function()
 			instance.Name = value
 		end)
-	elseif property == "Anchored" or property == "CanCollide" then
+	elseif property == "Anchored" or property == "CanCollide" or property == "Massless" then
+		if not instance:IsA("BasePart") and (property == "Massless" or property == "Anchored" or property == "CanCollide") then
+			-- Anchored/CanCollide/Massless only meaningful on BaseParts; still attempt safely
+		end
 		if type(value) ~= "boolean" then
 			return false, ("set_property: %s must be a boolean"):format(property)
 		end
@@ -286,6 +516,14 @@ local function actionSetProperty(data)
 		ok, setErr = pcall(function()
 			(instance :: any)[property] = vec
 		end)
+	elseif property == "Orientation" or property == "Rotation" then
+		local vec = toOrientationDegrees(value)
+		if not vec then
+			return false, "set_property: Orientation/Rotation must be 3 numbers in degrees [x, y, z] or {x,y,z}"
+		end
+		ok, setErr = pcall(function()
+			(instance :: any).Orientation = vec
+		end)
 	elseif property == "Color" then
 		local c = toColor3(value)
 		if not c then
@@ -302,6 +540,36 @@ local function actionSetProperty(data)
 		ok, setErr = pcall(function()
 			(instance :: any).Material = mat
 		end)
+	elseif property == "Shape" then
+		local shape = toPartShape(value)
+		if not shape then
+			return false, "set_property: Shape must be one of: Block, Ball, Cylinder"
+		end
+		ok, setErr = pcall(function()
+			(instance :: any).Shape = shape
+		end)
+	elseif property == "Density" or property == "Friction" or property == "Elasticity" or property == "FrictionWeight" or property == "ElasticityWeight" then
+		local num = tonumber(value)
+		if not num then
+			return false, ("set_property: %s must be a number"):format(property)
+		end
+		if property == "Density" and (num < 0.01 or num > 100) then
+			return false, "set_property: Density must be 0.01-100"
+		end
+		if property == "Friction" and (num < 0 or num > 2) then
+			return false, "set_property: Friction must be 0-2"
+		end
+		if property == "Elasticity" and (num < 0 or num > 1) then
+			return false, "set_property: Elasticity must be 0-1"
+		end
+		if (property == "FrictionWeight" or property == "ElasticityWeight") and (num < 0 or num > 100) then
+			return false, ("set_property: %s must be 0-100"):format(property)
+		end
+		local sok, smsg = setCustomPhysicalScalar(instance, property, num)
+		if not sok then
+			return false, smsg
+		end
+		return true, { path = fullPathOf(instance), property = property }
 	end
 	if not ok then
 		return false, ("set_property failed: %s"):format(tostring(setErr))
@@ -358,6 +626,47 @@ local function actionInspectObject(data)
 	tryRead("Position", function()
 		local p: Vector3 = (instance :: any).Position
 		return { p.X, p.Y, p.Z }
+	end)
+	tryRead("Orientation", function()
+		local o: Vector3 = (instance :: any).Orientation
+		return { o.X, o.Y, o.Z }
+	end)
+	tryRead("Shape", function()
+		return tostring((instance :: any).Shape)
+	end)
+	tryRead("Massless", function()
+		return (instance :: any).Massless
+	end)
+	tryRead("Density", function()
+		local pp = (instance :: any).CustomPhysicalProperties
+		if typeof(pp) == "PhysicalProperties" then
+			return pp.Density
+		end
+		return nil
+	end)
+	tryRead("Friction", function()
+		local pp = (instance :: any).CustomPhysicalProperties
+		if typeof(pp) == "PhysicalProperties" then
+			return pp.Friction
+		end
+		return nil
+	end)
+	tryRead("Elasticity", function()
+		local pp = (instance :: any).CustomPhysicalProperties
+		if typeof(pp) == "PhysicalProperties" then
+			return pp.Elasticity
+		end
+		return nil
+	end)
+	tryRead("PrimaryPart", function()
+		if instance:IsA("Model") then
+			local pp = (instance :: any).PrimaryPart
+			if pp then
+				return { name = pp.Name, path = fullPathOf(pp) }
+			end
+			return nil
+		end
+		return nil
 	end)
 	tryRead("Color", function()
 		local c: Color3 = (instance :: any).Color
